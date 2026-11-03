@@ -1,0 +1,10 @@
+.pf-avatar { width: 112px; height: 112px; border-radius: 50%; object-fit: cover; background: var(--ok); color: #0b0f1a; display: grid; place-items: center; font-size: 3rem; font-weight: 800; border: 3px solid var(--line); }
+.pf-form { display: flex; flex-direction: column; gap: .6rem; width: min(360px, 100%); }
+.pf-form input[type='file'] { color: var(--dim); font: inherit; font-size: .8rem; }
+.pf-input { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .6rem .8rem; }
+.pf-input:focus { outline: none; border-color: var(--ok); }
+.pf-status { margin: 0; min-height: 1.2em; color: var(--dim); font-size: .85rem; }
+.pf-stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: .6rem; width: min(360px, 100%); }
+.pf-stat { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: .7rem; text-align: center; }
+.pf-stat b { display: block; font-size: 1.4rem; color: var(--ok); }
+.pf-stat small { color: var(--dim); }

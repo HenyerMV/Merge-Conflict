@@ -1,0 +1,33 @@
+.avatar { width: clamp(110px, 22vw, 160px); }
+.avatar svg { width: 100%; height: auto; overflow: visible; }
+.av-body { fill: var(--ok); }
+.av-caret { fill: var(--err); animation: blink 1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+.avatar { animation: bob 2.4s ease-in-out infinite; }
+@keyframes bob { 50% { transform: translateY(-6px); } }
+.avatar[data-mood='celebrating'] { animation: jump .5s ease-in-out infinite; }
+@keyframes jump { 50% { transform: translateY(-16px) rotate(-3deg); } }
+.avatar[data-mood='surprised'] { animation: pop .3s ease-out 1; }
+@keyframes pop { 40% { transform: scale(1.12); } }
+.avatar[data-mood='disappointed'] .av-body { fill: #8fb83a; }
+
+.dlg { width: min(560px, 100%); min-height: 7.5rem; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 1rem 1.2rem; cursor: pointer; }
+.dlg-name { color: var(--ok); letter-spacing: .12em; font-size: .85rem; }
+.dlg-text { margin: .4rem 0 .8rem; min-height: 3.2em; line-height: 1.5; }
+.dlg-actions { display: flex; flex-wrap: wrap; gap: .6rem; }
+.btn-small { padding: .55rem .9rem; font-size: .85rem; }
+
+.demo { width: min(560px, 100%); background: #0e1424; border: 1px solid var(--line); border-radius: 12px; padding: .9rem; animation: enter .35s ease-out both; }
+.demo-head { display: flex; justify-content: space-between; color: var(--dim); font-size: .85rem; }
+.demo-head b { color: var(--ink); font-size: 1.1rem; }
+.demo-challenge { margin: .6rem 0; font-size: .9rem; }
+.demo-panes { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; }
+.demo-panes small { color: var(--dim); }
+.demo pre { margin: .2rem 0 0; min-height: 4.2rem; padding: .5rem; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; font-size: .78rem; white-space: pre-wrap; overflow-x: auto; }
+.demo-status { margin-top: .6rem; min-height: 1.2em; font-weight: 700; font-size: .9rem; }
+.demo-status.ok { color: var(--ok); }
+.demo-status.err { color: var(--err); animation: shake .3s 1; }
+.demo-status.wait { color: var(--dim); }
+@keyframes shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+@media (max-width: 480px) { .demo-panes { grid-template-columns: 1fr; } }
+@media (prefers-reduced-motion: reduce) { .avatar, .av-caret, .demo-status { animation: none !important; } }

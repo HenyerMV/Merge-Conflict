@@ -1,0 +1,50 @@
+:root {
+  --bg: #0b0f1a;
+  --panel: #131a2b;
+  --ink: #e8ecf8;
+  --dim: #8b95b3;
+  --ok: #b6ff3b;      /* correcto / acción principal */
+  --err: #ff3d7f;     /* error / conflicto */
+  --line: #25304d;
+  font-family: ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace;
+}
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; margin: 0; }
+body { background: radial-gradient(1200px 600px at 50% -10%, #1a2550 0%, var(--bg) 60%); color: var(--ink); }
+
+.scene {
+  min-height: 100%; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 1.2rem; padding: max(1.5rem, env(safe-area-inset-top)) 1.5rem 2rem;
+  animation: enter .35s ease-out both;
+}
+@keyframes enter { from { opacity: 0; transform: translateY(10px); } }
+
+.logo { display: flex; flex-direction: column; align-items: center; line-height: .95; font-weight: 800; letter-spacing: .08em; }
+.logo-a { font-size: clamp(2.4rem, 10vw, 5rem); color: var(--ok); }
+.logo-b { font-size: clamp(2.4rem, 10vw, 5rem); color: var(--err); text-shadow: 3px 0 var(--ok); animation: glitch 3s infinite steps(1); }
+@keyframes glitch { 92% { transform: translateX(0); } 94% { transform: translateX(-4px); } 96% { transform: translateX(4px); } 98% { transform: translateX(0); } }
+.tagline { color: var(--dim); margin: 0; }
+.who { color: var(--dim); margin: 0; }
+
+.progress { width: min(320px, 70vw); height: 6px; background: var(--line); border-radius: 99px; overflow: hidden; }
+.progress i { display: block; height: 100%; width: 0; background: var(--ok); transition: width 1.3s ease-out; }
+
+.menu { display: flex; flex-direction: column; gap: .7rem; width: min(340px, 100%); }
+.btn {
+  font: inherit; font-weight: 700; letter-spacing: .1em; color: var(--ink); cursor: pointer;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: .9rem 1.2rem;
+  transition: transform .12s, border-color .12s, background .12s;
+}
+.btn:hover, .btn:focus-visible { border-color: var(--ok); transform: translateX(4px); outline: none; }
+.btn-primary { background: var(--ok); color: #0b0f1a; border-color: var(--ok); }
+.btn-primary:hover, .btn-primary:focus-visible { background: #cbff6b; }
+
+.ph-title { margin: 0; font-size: 2rem; letter-spacing: .1em; }
+.ph-phase { margin: 0; color: var(--ok); }
+.ph-note { margin: 0; color: var(--dim); text-align: center; max-width: 36ch; }
+.error { color: var(--err); }
+
+@media (prefers-reduced-motion: reduce) {
+  .scene, .logo-b { animation: none; }
+  .progress i { transition: none; }
+}
