@@ -56,7 +56,7 @@ describe('buildMatchPlan', () => {
     const rank = { easy: 0, medium: 1, hard: 2 };
     const plan = buildMatchPlan(PUBLIC_CHALLENGES, 'xyz');
     for (let i = 1; i < plan.length; i++) {
-      expect(rank[plan[i].difficulty]).toBeGreaterThanOrEqual(rank[plan[i - 1].difficulty]);
+      expect(rank[plan[i]!.difficulty]).toBeGreaterThanOrEqual(rank[plan[i - 1]!.difficulty]);
     }
   });
   it('falla si faltan desafíos', () => {
