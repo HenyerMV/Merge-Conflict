@@ -62,6 +62,9 @@ export function judgeRuns(tests: readonly TestCase[], runs: readonly RawRun[]): 
   for (let i = 0; i < runs.length; i++) {
     const test = tests[i];
     const run = runs[i];
+    if (!test || !run) {
+      return { verdict: 'sandbox_error', passed, total, executionMs, message: FIXED_MESSAGES.sandbox_error };
+    }
     const failure = classifyRun(run);
 
     if (failure) {
