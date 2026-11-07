@@ -3,13 +3,18 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "workspaces": ["packages/*", "apps/*"],
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc --noEmit -p packages/shared",
+    "typecheck": "tsc --noEmit -p packages/shared && tsc --noEmit -p apps/runner",
     "typecheck:web": "tsc --noEmit -p apps/web",
     "dev:web": "npm run dev -w @merge-conflict/web",
-    "build:web": "npm run build -w @merge-conflict/web"
+    "build:web": "npm run build -w @merge-conflict/web",
+    "runner": "npm run start -w @merge-conflict/runner",
+    "smoke:runner": "npm run smoke -w @merge-conflict/runner"
   },
   "devDependencies": {
     "typescript": "^5.6.0",
