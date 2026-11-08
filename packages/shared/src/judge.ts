@@ -70,7 +70,9 @@ export function judgeRuns(tests: readonly TestCase[], runs: readonly RawRun[]): 
 
     if (failure) {
       let message: string | undefined;
-      if (failure === 'syntax_error' || failure === 'runtime_error') {
+            if (failure === 'runtime_error' && test.hidden) {
+        message = 'Tu código falló en un test oculto.';
+      } else if (failure === 'syntax_error' || failure === 'runtime_error') {
         message = lastErrorLine(run.stderr) || undefined;
       } else {
         message = FIXED_MESSAGES[failure];
