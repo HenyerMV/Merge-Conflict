@@ -9,7 +9,7 @@
   ],
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc --noEmit -p packages/shared && tsc --noEmit -p apps/runner",
+    "typecheck": "tsc --noEmit -p packages/shared && tsc --noEmit -p apps/runner && tsc --noEmit -p apps/server",
     "typecheck:web": "tsc --noEmit -p apps/web",
     "dev:web": "npm run dev -w @merge-conflict/web",
     "build:web": "npm run build -w @merge-conflict/web",
