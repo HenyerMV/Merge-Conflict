@@ -1,425 +1,368 @@
-// Motor de partida 1v1 (autoridad del servidor). NO usa red: recibe mensajes del cliente y emite
-// mensajes del servidor mediante `send`. El cliente solo pide; el motor decide puntos, tiempos y ganador.
-import {
-  DEFAULT_CONFIG,
-  afterFailedAttempt,
-  awardRound,
-  canTransition,
-  matchOutcome,
-  orderSubmissions,
-  toPublicChallenge,
-  type Challenge,
-  type ClientMsg,
-  type MatchConfig,
-  type MatchStatus,
-  type PlayerRef,
-  type RoundEndReason,
-  type Score,
-  type ServerMsg,
-  type ValidationResult,
-} from '@merge-conflict/shared';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { canTransition, type Challenge, type PlayerRef, type ServerMsg, type ValidationResult } from '@merge-conflict/shared';
+import { MatchEngine, type Judge, type MatchEngineOptions, type MatchResult } from './engine';
 
-/** Califica un envío (en producción llama al runner). Puede rechazar la promesa: cuenta como sandbox_error. */
-export type Judge = (challengeId: string, code: string) => Promise<ValidationResult>;
+const A: PlayerRef = { id: 'A', isGuest: false, displayName: 'Ana' };
+const B: PlayerRef = { id: 'B', isGuest: false, displayName: 'Beto' };
 
-export interface ChallengeSource {
-  forRound(roundNumber: number): Challenge;
+function mkChallenge(id: string): Challenge {
+  return {
+    id, language: 'python', difficulty: 'easy', title: id, description: 'd', starterCode: '',
+    tests: [
+      { id: `${id}-v1`, input: '1', expected: '2', hidden: false },
+      { id: `${id}-h1`, input: 'SECRET-INPUT', expected: 'SECRET-OUTPUT', hidden: true },
+    ],
+    constraints: [], timeLimitMs: 2000, memoryLimitMb: 128,
+  };
 }
 
-export interface MatchResult {
-  matchId: string;
-  winnerId: string | null;
-  score: Score;
-  totalMs: number;
-  endedBy: 'normal' | 'abandoned';
-  roundsPlayed: number;
+const ok: ValidationResult = { verdict: 'correct', passed: 2, total: 2, executionMs: 5 };
+const wrong: ValidationResult = { verdict: 'wrong_output', passed: 0, total: 2, executionMs: 5, message: 'Falló un test visible.' };
+const sbx: ValidationResult = { verdict: 'sandbox_error', passed: 0, total: 2, executionMs: 0, message: 'Error interno.' };
+
+// Códigos de prueba: OK / BAD / SBX responden al instante, BOOM rechaza, cualquier otro queda "en espera" hasta release().
+function makeJudge() {
+  const held = new Map<string, (r: ValidationResult) => void>();
+  const judge: Judge = (_id, code) => {
+    if (code === 'OK') return Promise.resolve(ok);
+    if (code === 'BAD') return Promise.resolve(wrong);
+    if (code === 'SBX') return Promise.resolve(sbx);
+    if (code === 'BOOM') return Promise.reject(new Error('runner caído'));
+    return new Promise<ValidationResult>((resolve) => held.set(code, resolve));
+  };
+  return { judge, release: (code: string, r: ValidationResult) => held.get(code)?.(r) };
 }
 
-export interface MatchEngineOptions {
-  matchId: string;
-  players: readonly [PlayerRef, PlayerRef];
-  source: ChallengeSource;
-  judge: Judge;
-  send: (playerId: string, msg: ServerMsg) => void;
-  onFinished?: (result: MatchResult) => void;
-  config?: Partial<MatchConfig>;
-  betweenRoundsMs?: number; // pausa entre rondas (por defecto 4000)
-  pendingGraceMs?: number; // espera máxima por envíos en validación al vencer la ronda (por defecto 30000)
-  maxTiebreakRounds?: number; // rondas extra de muerte súbita antes de declarar empate (por defecto 5)
-  maxCodeChars?: number; // por defecto 20000
+type Sent = { to: string; msg: ServerMsg };
+
+function setup(over: Partial<MatchEngineOptions> = {}) {
+  const sent: Sent[] = [];
+  const finished: MatchResult[] = [];
+  const j = makeJudge();
+  const engine = new MatchEngine({
+    matchId: 'm1',
+    players: [A, B],
+    source: { forRound: (n) => mkChallenge(`c${n}`) },
+    judge: j.judge,
+    send: (to, msg) => sent.push({ to, msg }),
+    onFinished: (r) => finished.push(r),
+    betweenRoundsMs: 1000,
+    ...over,
+  });
+  const msgs = <T extends ServerMsg['t']>(to: string, t: T) =>
+    sent.filter((s) => s.to === to && s.msg.t === t).map((s) => s.msg as Extract<ServerMsg, { t: T }>);
+  const roundId = () => {
+    const starts = msgs('A', 'round.start');
+    const last = starts[starts.length - 1];
+    if (!last) throw new Error('no hay round.start');
+    return last.roundId;
+  };
+  return {
+    engine, sent, finished, release: j.release, msgs, roundId,
+    start: () => {
+      engine.handle('A', { t: 'match.ready', matchId: 'm1' });
+      engine.handle('B', { t: 'match.ready', matchId: 'm1' });
+    },
+    submit: (who: string, code: string) => engine.handle(who, { t: 'code.submit', matchId: 'm1', roundId: roundId(), code }),
+    errors: (to: string) => msgs(to, 'error').map((e) => e.code),
+  };
 }
 
-type ErrorCode = Extract<ServerMsg, { t: 'error' }>['code'];
-type Timer = ReturnType<typeof setTimeout>;
+const flush = () => vi.advanceTimersByTimeAsync(0);
+const advance = (ms: number) => vi.advanceTimersByTimeAsync(ms);
 
-interface PlayerState {
-  ref: PlayerRef;
-  ready: boolean;
-  connected: boolean;
-  attemptsUsed: number;
-  validating: boolean;
-}
+beforeEach(() => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_000_000);
+});
+afterEach(() => vi.useRealTimers());
 
-interface Sub {
-  seq: number;
-  serverReceivedAt: number;
-  playerId: string;
-  done: boolean;
-  correct: boolean;
-}
+describe('inicio de partida', () => {
+  it('anuncia la partida y arranca la ronda 1 cuando ambos están listos', () => {
+    const t = setup();
+    expect(t.msgs('A', 'match.found')[0]?.opponent.id).toBe('B');
+    expect(t.msgs('B', 'match.found')[0]?.opponent.id).toBe('A');
+    t.engine.handle('A', { t: 'match.ready', matchId: 'm1' });
+    expect(t.msgs('A', 'round.start')).toHaveLength(0);
+    t.engine.handle('B', { t: 'match.ready', matchId: 'm1' });
+    expect(t.engine.currentStatus).toBe('CODING');
+    const r = t.msgs('A', 'round.start')[0]!;
+    expect(r.number).toBe(1);
+    expect(r.deadlineAt - r.serverStartAt).toBe(180_000);
+    expect(t.msgs('B', 'round.start')[0]?.challenge.id).toBe('c1');
+  });
 
-interface RoundState {
-  id: string;
-  number: number;
-  challenge: Challenge;
-  startedAt: number;
-  deadlineAt: number;
-  subs: Sub[];
-  deadlinePassed: boolean;
-  ended: boolean;
-}
+  it('nunca envía tests ocultos al cliente', async () => {
+    const t = setup();
+    t.start();
+    t.submit('A', 'OK');
+    await flush();
+    const all = JSON.stringify(t.sent);
+    expect(all).not.toContain('SECRET-INPUT');
+    expect(all).not.toContain('SECRET-OUTPUT');
+    expect(all).not.toContain('-h1');
+  });
 
-const err = (code: ErrorCode, message: string): ServerMsg => ({ t: 'error', code, message });
-
-export class MatchEngine {
-  private status: MatchStatus = 'WAITING';
-  private readonly cfg: MatchConfig;
-  private readonly players = new Map<string, PlayerState>();
-  private score: Score = {};
-  private roundsPlayed = 0;
-  private round: RoundState | null = null;
-  private seq = 0;
-  private startedAt = 0;
-  private finished = false;
-  private forfeitedBy: string | null = null;
-  private roundTimer: Timer | null = null;
-  private nextRoundTimer: Timer | null = null;
-  private readonly graceTimers = new Map<string, Timer>();
-  private readonly betweenRoundsMs: number;
-  private readonly pendingGraceMs: number;
-  private readonly maxTiebreakRounds: number;
-  private readonly maxCodeChars: number;
-
-  constructor(private readonly opts: MatchEngineOptions) {
-    this.cfg = { ...DEFAULT_CONFIG, ...opts.config };
-    this.betweenRoundsMs = opts.betweenRoundsMs ?? 4000;
-    this.pendingGraceMs = opts.pendingGraceMs ?? 30_000;
-    this.maxTiebreakRounds = opts.maxTiebreakRounds ?? 5;
-    this.maxCodeChars = opts.maxCodeChars ?? 20_000;
-
-    const [a, b] = opts.players;
-    if (a.id === b.id) throw new Error('Los dos jugadores deben ser distintos');
-    for (const ref of [a, b]) {
-      this.players.set(ref.id, { ref, ready: false, connected: true, attemptsUsed: 0, validating: false });
-      this.score[ref.id] = 0;
+  it('todos los cambios de estado respetan la máquina de estados', async () => {
+    const t = setup();
+    t.start();
+    t.submit('A', 'OK');
+    await flush();
+    await advance(1000);
+    t.engine.handle('B', { t: 'match.leave', matchId: 'm1' });
+    const states = t.msgs('A', 'state').map((s) => s.status);
+    let prev: (typeof states)[number] = 'WAITING';
+    for (const s of states) {
+      expect(canTransition(prev, s), `${prev} -> ${s}`).toBe(true);
+      prev = s;
     }
-    this.emit(a.id, { t: 'match.found', matchId: opts.matchId, opponent: b, config: this.cfg });
-    this.emit(b.id, { t: 'match.found', matchId: opts.matchId, opponent: a, config: this.cfg });
-    this.go('MATCH_FOUND');
-  }
+    expect(states[states.length - 1]).toBe('RETURN_TO_LOBBY');
+  });
+});
 
-  get currentStatus(): MatchStatus {
-    return this.status;
-  }
-  get currentScore(): Score {
-    return { ...this.score };
-  }
-  get isFinished(): boolean {
-    return this.finished;
-  }
+describe('rondas', () => {
+  it('el primer envío correcto gana la ronda y suma 1 punto', async () => {
+    const t = setup();
+    t.start();
+    t.submit('A', 'OK');
+    expect(t.msgs('A', 'submission.validating')[0]?.attempt).toBe(1);
+    await flush();
+    expect(t.msgs('A', 'submission.result')[0]).toMatchObject({ verdict: 'correct', attemptsLeft: 3 });
+    const end = t.msgs('B', 'round.end')[0]!;
+    expect(end).toMatchObject({ winnerId: 'A', reason: 'solved', score: { A: 1, B: 0 } });
+    await advance(1000);
+    expect(t.msgs('A', 'round.start')[1]?.number).toBe(2);
+  });
 
-  /** Mensaje de un jugador. Todo lo que no sea una solicitud válida se rechaza con un error. */
-  handle(playerId: string, msg: ClientMsg): void {
-    const p = this.players.get(playerId);
-    if (!p) return this.emit(playerId, err('NOT_IN_MATCH', 'No perteneces a esta partida'));
-    if (this.finished) return this.emit(playerId, err('BAD_STATE', 'La partida ya terminó'));
-
-    switch (msg.t) {
-      case 'ping':
-        return this.emit(playerId, { t: 'pong', clientTime: msg.clientTime, serverNow: Date.now() });
-
-      case 'match.ready': {
-        if (msg.matchId !== this.opts.matchId) return this.emit(playerId, err('NOT_IN_MATCH', 'Partida incorrecta'));
-        if (this.status !== 'MATCH_FOUND') return this.emit(playerId, err('BAD_STATE', 'La partida ya empezó'));
-        p.ready = true;
-        if ([...this.players.values()].every((x) => x.ready)) {
-          this.go('READY');
-          this.startRound();
-        }
-        return;
-      }
-
-      case 'code.submit':
-        return this.submit(p, msg);
-
-      case 'match.leave': {
-        if (msg.matchId !== this.opts.matchId) return this.emit(playerId, err('NOT_IN_MATCH', 'Partida incorrecta'));
-        p.connected = false;
-        return this.abandon();
-      }
-
-      default:
-        return this.emit(playerId, err('BAD_STATE', 'Mensaje no válido durante una partida'));
+  it('tres intentos fallidos pierden la ronda y el rival suma el punto', async () => {
+    const t = setup();
+    t.start();
+    for (let i = 0; i < 3; i++) {
+      t.submit('A', 'BAD');
+      await flush();
     }
+    expect(t.msgs('A', 'submission.result').map((r) => r.attemptsLeft)).toEqual([2, 1, 0]);
+    expect(t.msgs('A', 'round.end')[0]).toMatchObject({ winnerId: 'B', reason: 'three_errors', score: { A: 0, B: 1 } });
+  });
+
+  it('un error del ejecutor (sandbox_error o caída) no gasta intentos', async () => {
+    const t = setup();
+    t.start();
+    t.submit('A', 'SBX');
+    await flush();
+    t.submit('A', 'BOOM');
+    await flush();
+    t.submit('A', 'BAD');
+    await flush();
+    const r = t.msgs('A', 'submission.result');
+    expect(r.map((x) => x.verdict)).toEqual(['sandbox_error', 'sandbox_error', 'wrong_output']);
+    expect(r.map((x) => x.attemptsLeft)).toEqual([3, 3, 2]);
+    expect(t.msgs('A', 'round.end')).toHaveLength(0);
+  });
+
+  it('si ambos aciertan, gana el envío más temprano aunque se califique después', async () => {
+    const t = setup();
+    t.start();
+    t.submit('A', 'HOLD:A');
+    await advance(5);
+    t.submit('B', 'HOLD:B');
+    t.release('HOLD:B', ok);
+    await flush();
+    expect(t.msgs('A', 'round.end')).toHaveLength(0); // falta el veredicto de A, que envió antes
+    t.release('HOLD:A', ok);
+    await flush();
+    expect(t.msgs('A', 'round.end')[0]).toMatchObject({ winnerId: 'A', reason: 'solved' });
+  });
+
+  it('si el envío más temprano falla, gana el siguiente que acertó', async () => {
+    const t = setup();
+    t.start();
+    t.submit('A', 'HOLD:A');
+    await advance(5);
+    t.submit('B', 'HOLD:B');
+    t.release('HOLD:B', ok);
+    await flush();
+    t.release('HOLD:A', wrong);
+    await flush();
+    expect(t.msgs('A', 'round.end')[0]).toMatchObject({ winnerId: 'B', reason: 'solved' });
+  });
+
+  it('no permite un segundo envío mientras el anterior se califica', async () => {
+    const t = setup();
+    t.start();
+    t.submit('A', 'HOLD:A');
+    t.submit('A', 'OK');
+    expect(t.errors('A')).toEqual(['RATE_LIMITED']);
+    t.release('HOLD:A', wrong);
+    await flush();
+    t.submit('A', 'BAD');
+    expect(t.errors('A')).toEqual(['RATE_LIMITED']); // el segundo envío válido no genera error
+  });
+
+  it('sin envíos, la ronda termina por tiempo sin ganador', async () => {
+    const t = setup();
+    t.start();
+    await advance(180_000);
+    expect(t.msgs('A', 'round.end')[0]).toMatchObject({ winnerId: null, reason: 'timeout', score: { A: 0, B: 0 } });
+    await advance(1000);
+    expect(t.msgs('A', 'round.start')[1]?.number).toBe(2);
+  });
+
+  it('un envío que llegó a tiempo pero se califica después del límite sigue contando', async () => {
+    const t = setup();
+    t.start();
+    t.submit('A', 'HOLD:A');
+    await advance(180_000);
+    expect(t.msgs('A', 'round.end')).toHaveLength(0);
+    t.release('HOLD:A', ok);
+    await flush();
+    expect(t.msgs('A', 'round.end')[0]).toMatchObject({ winnerId: 'A', reason: 'solved' });
+  });
+
+  it('si el ejecutor no responde, la ronda termina sin ganador tras la espera máxima', async () => {
+    const t = setup();
+    t.start();
+    t.submit('A', 'HOLD:A');
+    await advance(180_000 + 30_000);
+    expect(t.msgs('A', 'round.end')[0]).toMatchObject({ winnerId: null, reason: 'timeout' });
+    t.release('HOLD:A', ok); // llega tarde: se descarta
+    await flush();
+    expect(t.msgs('A', 'round.end')).toHaveLength(1);
+    expect(t.msgs('A', 'submission.result')).toHaveLength(0);
+  });
+});
+
+describe('fin de partida', () => {
+  async function winRound(t: ReturnType<typeof setup>, who: string) {
+    t.submit(who, 'OK');
+    await flush();
+    await advance(1000);
   }
 
-  /** El socket del jugador se cayó: empieza la gracia de reconexión. */
-  disconnect(playerId: string): void {
-    const p = this.players.get(playerId);
-    if (!p || this.finished || !p.connected) return;
-    p.connected = false;
-    const other = this.other(playerId);
-    this.emit(other.ref.id, { t: 'opponent.disconnected', graceMs: this.cfg.reconnectGraceMs });
-    this.graceTimers.set(
-      playerId,
-      setTimeout(() => this.onGraceExpired(playerId), this.cfg.reconnectGraceMs),
-    );
-  }
+  it('termina en cuanto alguien llega a 6 puntos', async () => {
+    const t = setup();
+    t.start();
+    for (let i = 0; i < 6; i++) await winRound(t, 'A');
+    expect(t.msgs('B', 'match.end')[0]).toMatchObject({ winnerId: 'A', score: { A: 6, B: 0 } });
+    expect(t.finished[0]).toMatchObject({ winnerId: 'A', endedBy: 'normal', roundsPlayed: 6 });
+    expect(t.engine.isFinished).toBe(true);
+    expect(t.msgs('A', 'round.start')).toHaveLength(6); // no hay ronda 7
+  });
 
-  /** El jugador volvió dentro de la gracia: se le reenvía el estado actual. */
-  reconnect(playerId: string): void {
-    const p = this.players.get(playerId);
-    if (!p || this.finished || p.connected || this.forfeitedBy === playerId) return;
-    p.connected = true;
-    const timer = this.graceTimers.get(playerId);
-    if (timer) clearTimeout(timer);
-    this.graceTimers.delete(playerId);
-    this.emit(this.other(playerId).ref.id, { t: 'opponent.reconnected' });
-    this.emit(playerId, { t: 'state', status: this.status, serverNow: Date.now() });
-    const r = this.round;
-    if (r && !r.ended) this.emit(playerId, this.roundStartMsg(r));
-  }
+  it('5-5 tras 10 rondas va a muerte súbita y la gana quien suma el siguiente punto', async () => {
+    const t = setup();
+    t.start();
+    for (let i = 1; i <= 10; i++) await winRound(t, i % 2 === 1 ? 'A' : 'B');
+    expect(t.engine.currentScore).toEqual({ A: 5, B: 5 });
+    expect(t.finished).toHaveLength(0);
+    expect(t.msgs('A', 'round.start')[10]?.number).toBe(11);
+    await winRound(t, 'A');
+    expect(t.finished[0]).toMatchObject({ winnerId: 'A', endedBy: 'normal', roundsPlayed: 11 });
+  });
 
-  /** Libera temporizadores (cierre del servidor). */
-  dispose(): void {
-    this.finished = true;
-    this.clearTimers();
-  }
+  it('si la muerte súbita no se resuelve tras varias rondas, termina en empate', async () => {
+    const t = setup({ maxTiebreakRounds: 2 });
+    t.start();
+    for (let i = 1; i <= 10; i++) await winRound(t, i % 2 === 1 ? 'A' : 'B');
+    await advance(180_000); // ronda 11 sin ganador
+    await advance(1000);
+    await advance(180_000); // ronda 12 sin ganador
+    expect(t.finished[0]).toMatchObject({ winnerId: null, endedBy: 'normal', roundsPlayed: 12 });
+  });
 
-  // ---------- internos ----------
+  it('rechaza envíos cuando la partida terminó', async () => {
+    const t = setup();
+    t.start();
+    for (let i = 0; i < 6; i++) await winRound(t, 'A');
+    t.engine.handle('B', { t: 'code.submit', matchId: 'm1', roundId: 'm1-r6', code: 'OK' });
+    expect(t.errors('B')).toEqual(['BAD_STATE']);
+  });
+});
 
-  private other(playerId: string): PlayerState {
-    for (const p of this.players.values()) if (p.ref.id !== playerId) return p;
-    throw new Error('Jugador rival no encontrado');
-  }
+describe('solicitudes inválidas', () => {
+  it('rechaza mensajes fuera de lugar', async () => {
+    const t = setup();
+    // antes de que ambos estén listos
+    t.engine.handle('A', { t: 'code.submit', matchId: 'm1', roundId: 'm1-r1', code: 'OK' });
+    t.start();
+    t.engine.handle('A', { t: 'code.submit', matchId: 'otra', roundId: t.roundId(), code: 'OK' });
+    t.engine.handle('A', { t: 'code.submit', matchId: 'm1', roundId: 'm1-r9', code: 'OK' });
+    t.engine.handle('A', { t: 'code.submit', matchId: 'm1', roundId: t.roundId(), code: '' });
+    t.engine.handle('A', { t: 'code.submit', matchId: 'm1', roundId: t.roundId(), code: 'x'.repeat(20_001) });
+    t.engine.handle('A', { t: 'match.ready', matchId: 'm1' }); // la partida ya empezó
+    t.engine.handle('A', { t: 'queue.leave' });
+    t.engine.handle('Z', { t: 'ping', clientTime: 1 }); // desconocido
+    expect(t.errors('A')).toEqual(['BAD_STATE', 'NOT_IN_MATCH', 'BAD_STATE', 'BAD_STATE', 'BAD_STATE', 'BAD_STATE', 'BAD_STATE']);
+    expect(t.errors('Z')).toEqual(['NOT_IN_MATCH']);
+    expect(t.msgs('A', 'submission.validating')).toHaveLength(0);
+  });
 
-  private emit(playerId: string, msg: ServerMsg): void {
-    this.opts.send(playerId, msg);
-  }
+  it('no acepta envíos entre rondas', async () => {
+    const t = setup();
+    t.start();
+    t.submit('A', 'OK');
+    await flush();
+    t.engine.handle('B', { t: 'code.submit', matchId: 'm1', roundId: 'm1-r1', code: 'OK' });
+    expect(t.errors('B')).toEqual(['BAD_STATE']);
+  });
 
-  private broadcast(msg: ServerMsg): void {
-    for (const id of this.players.keys()) this.emit(id, msg);
-  }
+  it('responde ping con la hora del servidor', () => {
+    const t = setup();
+    t.engine.handle('A', { t: 'ping', clientTime: 123 });
+    expect(t.msgs('A', 'pong')[0]).toEqual({ t: 'pong', clientTime: 123, serverNow: 1_000_000 });
+  });
+});
 
-  private go(to: MatchStatus): void {
-    if (!canTransition(this.status, to)) throw new Error(`Transición inválida: ${this.status} -> ${to}`);
-    this.status = to;
-    this.broadcast({ t: 'state', status: to, serverNow: Date.now() });
-  }
+describe('desconexión y abandono', () => {
+  it('si no vuelve en 15 s pierde por abandono', async () => {
+    const t = setup();
+    t.start();
+    t.engine.disconnect('A');
+    expect(t.msgs('B', 'opponent.disconnected')[0]?.graceMs).toBe(15_000);
+    await advance(15_000);
+    expect(t.msgs('B', 'match.end')[0]?.winnerId).toBe('B');
+    expect(t.finished[0]).toMatchObject({ winnerId: 'B', endedBy: 'abandoned' });
+  });
 
-  private clearTimers(): void {
-    if (this.roundTimer) clearTimeout(this.roundTimer);
-    if (this.nextRoundTimer) clearTimeout(this.nextRoundTimer);
-    for (const t of this.graceTimers.values()) clearTimeout(t);
-    this.roundTimer = null;
-    this.nextRoundTimer = null;
-    this.graceTimers.clear();
-  }
+  it('si vuelve dentro de la gracia, la partida sigue y recibe el estado actual', async () => {
+    const t = setup();
+    t.start();
+    t.engine.disconnect('A');
+    await advance(10_000);
+    t.engine.reconnect('A');
+    expect(t.msgs('B', 'opponent.reconnected')).toHaveLength(1);
+    expect(t.msgs('A', 'round.start')).toHaveLength(2); // el reenvío del estado de la ronda
+    await advance(20_000);
+    expect(t.finished).toHaveLength(0);
+    expect(t.engine.currentStatus).toBe('CODING');
+  });
 
-  private roundStartMsg(r: RoundState): ServerMsg {
-    return {
-      t: 'round.start',
-      roundId: r.id,
-      number: r.number,
-      challenge: toPublicChallenge(r.challenge), // nunca viajan los tests ocultos
-      serverStartAt: r.startedAt,
-      deadlineAt: r.deadlineAt,
-    };
-  }
+  it('si se desconectan los dos, el resultado es empate', async () => {
+    const t = setup();
+    t.start();
+    t.engine.disconnect('A');
+    await advance(5_000);
+    t.engine.disconnect('B');
+    await advance(10_000);
+    expect(t.finished[0]).toMatchObject({ winnerId: null, endedBy: 'abandoned' });
+  });
 
-  private startRound(): void {
-    this.go('ROUND_START');
-    if (this.forfeitedBy) return this.abandon(); // alguien abandonó durante la pausa entre rondas
+  it('irse a propósito (match.leave) da la victoria al rival', () => {
+    const t = setup();
+    t.start();
+    t.engine.handle('B', { t: 'match.leave', matchId: 'm1' });
+    expect(t.finished[0]).toMatchObject({ winnerId: 'A', endedBy: 'abandoned' });
+  });
 
-    const number = this.roundsPlayed + 1;
-    const now = Date.now();
-    if (number === 1) this.startedAt = now;
-    const round: RoundState = {
-      id: `${this.opts.matchId}-r${number}`,
-      number,
-      challenge: this.opts.source.forRound(number),
-      startedAt: now,
-      deadlineAt: now + this.cfg.roundTimeLimitMs,
-      subs: [],
-      deadlinePassed: false,
-      ended: false,
-    };
-    this.round = round;
-    for (const p of this.players.values()) {
-      p.attemptsUsed = 0;
-      p.validating = false;
-    }
-    this.broadcast(this.roundStartMsg(round));
-    this.go('CODING');
-    this.roundTimer = setTimeout(() => this.onDeadline(), this.cfg.roundTimeLimitMs);
-  }
-
-  private submit(p: PlayerState, msg: Extract<ClientMsg, { t: 'code.submit' }>): void {
-    const id = p.ref.id;
-    const round = this.round;
-    if (msg.matchId !== this.opts.matchId) return this.emit(id, err('NOT_IN_MATCH', 'Partida incorrecta'));
-    if (this.status !== 'CODING' || !round || round.ended) return this.emit(id, err('BAD_STATE', 'No hay una ronda activa'));
-    if (msg.roundId !== round.id) return this.emit(id, err('BAD_STATE', 'Ronda incorrecta'));
-    if (typeof msg.code !== 'string' || msg.code.length === 0 || msg.code.length > this.maxCodeChars) {
-      return this.emit(id, err('BAD_STATE', 'Código vacío o demasiado largo'));
-    }
-    if (round.deadlinePassed || Date.now() >= round.deadlineAt) return this.emit(id, err('BAD_STATE', 'Se acabó el tiempo de la ronda'));
-    if (p.validating) return this.emit(id, err('RATE_LIMITED', 'Espera el resultado de tu envío anterior'));
-    if (p.attemptsUsed >= this.cfg.maxAttemptsPerRound) return this.emit(id, err('BAD_STATE', 'No te quedan intentos'));
-
-    const sub: Sub = { seq: ++this.seq, serverReceivedAt: Date.now(), playerId: id, done: false, correct: false };
-    round.subs.push(sub);
-    p.validating = true;
-    this.emit(id, { t: 'submission.validating', attempt: p.attemptsUsed + 1 });
-    void this.grade(round, p, sub, msg.code);
-  }
-
-  private async grade(round: RoundState, p: PlayerState, sub: Sub, code: string): Promise<void> {
-    let result: ValidationResult;
-    try {
-      result = await this.opts.judge(round.challenge.id, code);
-    } catch {
-      result = {
-        verdict: 'sandbox_error',
-        passed: 0,
-        total: round.challenge.tests.length,
-        executionMs: 0,
-        message: 'Error interno al ejecutar tu código. Intenta de nuevo.',
-      };
-    }
-    if (this.finished || round.ended) return; // la ronda terminó mientras se calificaba: se descarta
-
-    p.validating = false;
-    sub.done = true;
-    const attempt = p.attemptsUsed + 1;
-    const msg = (attemptsLeft: number): ServerMsg => ({
-      t: 'submission.result',
-      attempt,
-      verdict: result.verdict,
-      passed: result.passed,
-      total: result.total,
-      attemptsLeft,
-      ...(result.message ? { message: result.message } : {}),
-    });
-
-    if (result.verdict === 'correct') {
-      sub.correct = true;
-      this.emit(p.ref.id, msg(this.cfg.maxAttemptsPerRound - p.attemptsUsed));
-      return this.resolve(round);
-    }
-    if (result.verdict === 'sandbox_error') {
-      // Falla nuestra, no del jugador: no gasta intento.
-      this.emit(p.ref.id, msg(this.cfg.maxAttemptsPerRound - p.attemptsUsed));
-      return this.resolve(round);
-    }
-    const after = afterFailedAttempt(p.attemptsUsed, this.cfg);
-    p.attemptsUsed++;
-    this.emit(p.ref.id, msg(after.attemptsLeft));
-    if (after.roundLost) return this.endRound(round, this.other(p.ref.id).ref.id, 'three_errors');
-    this.resolve(round);
-  }
-
-  /** Decide si la ronda ya tiene ganador. Gana el envío correcto MÁS TEMPRANO (por hora del servidor y seq),
-   *  pero solo cuando todos los envíos anteriores a él ya fueron calificados. */
-  private resolve(round: RoundState): void {
-    if (round.ended) return;
-    for (const s of orderSubmissions(round.subs)) {
-      if (!s.done) return; // hay un envío anterior en validación: se espera su veredicto
-      if (s.correct) return this.endRound(round, s.playerId, 'solved');
-    }
-    if (round.deadlinePassed) this.endRound(round, null, 'timeout');
-  }
-
-  private onDeadline(): void {
-    const round = this.round;
-    if (!round || round.ended || this.finished) return;
-    round.deadlinePassed = true;
-    this.resolve(round);
-    if (!round.ended) {
-      // Quedan envíos en validación: se espera un poco; si el ejecutor no responde, nadie gana la ronda.
-      this.roundTimer = setTimeout(() => {
-        if (!round.ended && !this.finished) this.endRound(round, null, 'timeout');
-      }, this.pendingGraceMs);
-    }
-  }
-
-  private endRound(round: RoundState, winnerId: string | null, reason: RoundEndReason): void {
-    round.ended = true;
-    if (this.roundTimer) clearTimeout(this.roundTimer);
-    this.roundTimer = null;
-    this.roundsPlayed++;
-    if (winnerId) this.score = awardRound(this.score, winnerId);
-    this.go('ROUND_RESULT');
-    this.broadcast({
-      t: 'round.end',
-      roundId: round.id,
-      winnerId,
-      reason,
-      durationMs: Date.now() - round.startedAt,
-      score: { ...this.score },
-    });
-
-    const outcome = matchOutcome(this.score, this.roundsPlayed, this.cfg);
-    if (outcome.over) return this.finish(outcome.winnerId);
-    if (outcome.tiebreak && this.roundsPlayed - this.cfg.totalRounds >= this.maxTiebreakRounds) return this.finish(null);
-
-    this.go('NEXT_ROUND');
-    this.nextRoundTimer = setTimeout(() => this.startRound(), this.betweenRoundsMs);
-  }
-
-  private finish(winnerId: string | null): void {
-    this.go('MATCH_RESULT');
-    const totalMs = Date.now() - this.startedAt;
-    this.finished = true;
-    this.clearTimers();
-    this.broadcast({ t: 'match.end', winnerId, score: { ...this.score }, totalMs });
-    this.opts.onFinished?.({
-      matchId: this.opts.matchId,
-      winnerId,
-      score: { ...this.score },
-      totalMs,
-      endedBy: 'normal',
-      roundsPlayed: this.roundsPlayed,
-    });
-    this.go('RETURN_TO_LOBBY');
-  }
-
-  private onGraceExpired(playerId: string): void {
-    this.graceTimers.delete(playerId);
-    const p = this.players.get(playerId);
-    if (!p || this.finished || p.connected) return;
-    if (canTransition(this.status, 'ABANDONED')) return this.abandon();
-    this.forfeitedBy = playerId; // pausa entre rondas: se aplica al empezar la siguiente
-  }
-
-  /** Termina por abandono: gana quien siga conectado; si ambos se fueron, empate. */
-  private abandon(): void {
-    if (this.finished) return;
-    const connected = [...this.players.values()].filter((p) => p.connected);
-    const winnerId = connected.length === 1 && connected[0] ? connected[0].ref.id : null;
-    this.go('ABANDONED');
-    const totalMs = this.startedAt > 0 ? Date.now() - this.startedAt : 0;
-    this.finished = true;
-    this.clearTimers();
-    this.broadcast({ t: 'match.end', winnerId, score: { ...this.score }, totalMs });
-    this.opts.onFinished?.({
-      matchId: this.opts.matchId,
-      winnerId,
-      score: { ...this.score },
-      totalMs,
-      endedBy: 'abandoned',
-      roundsPlayed: this.roundsPlayed,
-    });
-    this.go('RETURN_TO_LOBBY');
-  }
-}
+  it('el abandono durante la pausa entre rondas se aplica al empezar la siguiente', async () => {
+    const t = setup({ betweenRoundsMs: 20_000 });
+    t.start();
+    t.submit('A', 'OK');
+    await flush();
+    t.engine.disconnect('B');
+    await advance(15_000); // vence la gracia en plena pausa
+    expect(t.finished).toHaveLength(0);
+    await advance(5_000);
+    expect(t.finished[0]).toMatchObject({ winnerId: 'A', endedBy: 'abandoned', roundsPlayed: 1 });
+  });
+});
